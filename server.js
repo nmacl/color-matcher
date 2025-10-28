@@ -15,6 +15,11 @@ function normalizeColor(color) {
     .trim();
 }
 
+// Helper to create consonant-only version (for abbreviation matching)
+function getConsonants(str) {
+  return str.replace(/[aeiou]/gi, '').toLowerCase();
+}
+
 // Main matching endpoint
 app.post('/match-color', (req, res) => {
   const { ourColor, theirColors, threshold = 80 } = req.body;
@@ -28,12 +33,13 @@ app.post('/match-color', (req, res) => {
   // Normalize our color
   const ourNormalized = normalizeColor(ourColor);
 
-  // If exact match exists (after normalization), return it immediately
+  // STRATEGY 1: Exact match (after normalization)
   const exactMatch = theirColors.find(
     color => normalizeColor(color) === ourNormalized
   );
 
   if (exactMatch) {
+    console.log(`Exact match: "${ourColor}" -> "${exactMatch}"`);
     return res.json({
       matched: true,
       matchedColor: exactMatch,
@@ -43,15 +49,13 @@ app.post('/match-color', (req, res) => {
     });
   }
 
-  // No exact match - do fuzzy matching
-  // Normalize their colors for matching
+  // STRATEGY 2: Standard fuzzy match
   const colorChoices = theirColors.map(color => ({
     original: color,
     normalized: normalizeColor(color)
   }));
 
-  // Find best matches using fuzzball
-  const results = fuzz.extract(
+  const fuzzyResults = fuzz.extract(
     ourNormalized,
     colorChoices.map(c => c.normalized),
     {
@@ -61,26 +65,68 @@ app.post('/match-color', (req, res) => {
     }
   );
 
-  if (!results || results.length === 0) {
+  if (!fuzzyResults || fuzzyResults.length === 0) {
+    console.log(`No matches found for "${ourColor}"`);
     return res.json({
       matched: false,
       matchedColor: null,
       confidence: 0,
-      method: 'fuzzy',
+      method: 'none',
       needsReview: true,
       alternatives: []
     });
   }
 
-  // Get the best match
-  const bestMatch = results[0];
-  const bestColor = colorChoices[bestMatch[2]].original;
-  const confidence = bestMatch[1];
+  let bestMatch = fuzzyResults[0];
+  let bestColor = colorChoices[bestMatch[2]].original;
+  let confidence = bestMatch[1];
+  let method = 'fuzzy';
 
-  console.log(`Matching "${ourColor}" -> "${bestColor}" (${confidence}% confidence)`);
+  console.log(`Fuzzy match: "${ourColor}" -> "${bestColor}" (${confidence}%)`);
 
-  // Get top 3 alternatives
-  const alternatives = results.map(r => ({
+  // STRATEGY 3: If confidence too low, try consonant matching (for abbreviations)
+  if (confidence < 75) {
+    console.log(`Low confidence (${confidence}%), trying consonant matching...`);
+    
+    const ourConsonants = getConsonants(ourNormalized);
+    const consonantChoices = colorChoices.map(c => ({
+      original: c.original,
+      consonants: getConsonants(c.normalized)
+    }));
+
+    console.log(`  Our consonants: "${ourConsonants}"`);
+    console.log(`  Their consonants: ${JSON.stringify(consonantChoices.map(c => c.consonants))}`);
+
+    const consonantResults = fuzz.extract(
+      ourConsonants,
+      consonantChoices.map(c => c.consonants),
+      {
+        scorer: fuzz.ratio, // Simple Levenshtein distance works well for consonants
+        limit: 3,
+        cutoff: 50
+      }
+    );
+
+    const consonantBest = consonantResults[0];
+    const consonantConfidence = consonantBest[1];
+
+    console.log(`  Consonant best match: "${consonantChoices[consonantBest[2]].original}" (${consonantConfidence}%)`);
+
+    // If consonant matching is significantly better, use it
+    if (consonantConfidence > confidence + 10) { // +10 buffer to prefer consonant
+      bestMatch = consonantBest;
+      bestColor = consonantChoices[consonantBest[2]].original;
+      confidence = consonantConfidence;
+      method = 'consonant';
+      
+      console.log(`  → Using consonant match: "${bestColor}" (${confidence}%)`);
+    }
+  }
+
+  console.log(`Final result: "${ourColor}" -> "${bestColor}" (${confidence}% via ${method})`);
+
+  // Get top 3 alternatives from fuzzy results
+  const alternatives = fuzzyResults.slice(0, 3).map(r => ({
     color: colorChoices[r[2]].original,
     confidence: r[1]
   }));
@@ -88,8 +134,8 @@ app.post('/match-color', (req, res) => {
   return res.json({
     matched: confidence >= threshold,
     matchedColor: confidence >= threshold ? bestColor : null,
-    confidence: confidence,
-    method: 'fuzzy',
+    confidence: Math.round(confidence),
+    method: method,
     needsReview: confidence < 90,
     alternatives: alternatives
   });
@@ -97,7 +143,7 @@ app.post('/match-color', (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'sanmar-color-matcher' });
+  res.json({ status: 'ok', service: 'color-matcher' });
 });
 
 // Test endpoint
@@ -106,7 +152,9 @@ app.post('/test', (req, res) => {
     { our: 'HeatheredRoyalGray', their: ['Heather Royal Gray', 'Royal Blue', 'Heathered Royal Gry'] },
     { our: 'NavyBlazer', their: ['Navy Blazer', 'Navy Blue', 'Black'] },
     { our: 'TNFBlack', their: ['TNF Black', 'The North Face Black', 'Black'] },
-    { our: 'JetBlack', their: ['Jet Black', 'Black', 'True Black'] }
+    { our: 'JetBlack', their: ['Jet Black', 'Black', 'True Black'] },
+    { our: 'TNFDarkGreyHeathe', their: ['TNFDkGyH', 'TNF Black', 'Dark Grey'] },
+    { our: 'UrbanNavyHeather', their: ['UrbNvyHt', 'Navy', 'Urban Navy'] }
   ];
 
   const results = testCases.map(test => {
@@ -116,7 +164,8 @@ app.post('/test', (req, res) => {
       normalized: normalizeColor(c) 
     }));
     
-    const matches = fuzz.extract(
+    // Try fuzzy
+    const fuzzyMatches = fuzz.extract(
       ourNormalized,
       colorChoices.map(c => c.normalized),
       {
@@ -125,13 +174,43 @@ app.post('/test', (req, res) => {
       }
     );
     
-    const best = matches[0];
+    const fuzzyBest = fuzzyMatches[0];
+    let bestColor = colorChoices[fuzzyBest[2]].original;
+    let confidence = fuzzyBest[1];
+    let method = 'fuzzy';
+    
+    // Try consonant if low
+    if (confidence < 75) {
+      const ourConsonants = getConsonants(ourNormalized);
+      const consonantChoices = colorChoices.map(c => ({
+        original: c.original,
+        consonants: getConsonants(c.normalized)
+      }));
+      
+      const consonantMatches = fuzz.extract(
+        ourConsonants,
+        consonantChoices.map(c => c.consonants),
+        {
+          scorer: fuzz.ratio,
+          limit: 1
+        }
+      );
+      
+      const consonantBest = consonantMatches[0];
+      
+      if (consonantBest[1] > confidence + 10) {
+        bestColor = consonantChoices[consonantBest[2]].original;
+        confidence = consonantBest[1];
+        method = 'consonant';
+      }
+    }
     
     return {
       input: test.our,
       options: test.their,
-      matched: colorChoices[best[2]].original,
-      confidence: best[1]
+      matched: bestColor,
+      confidence: Math.round(confidence),
+      method: method
     };
   });
 
