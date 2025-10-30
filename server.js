@@ -22,7 +22,7 @@ function getConsonants(str) {
 
 // Main matching endpoint
 app.post('/match-color', (req, res) => {
-  const { ourColor, theirColors, threshold = 80 } = req.body;
+  const { ourColor, theirColors, threshold = 74 } = req.body;
 
   if (!ourColor || !theirColors || !Array.isArray(theirColors)) {
     return res.status(400).json({
